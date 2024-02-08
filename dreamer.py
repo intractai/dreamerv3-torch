@@ -193,6 +193,15 @@ def make_env(config, mode, id):
 
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
         env = wrappers.OneHotAction(env)
+    elif suite == "toytext":
+        from envs.toy_text import ToyTextEnv
+        from transformers import AutoTokenizer
+
+        tokenizer_name = config.llm['tokenizer_id'] or config.llm['model_id']
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+        env = ToyTextEnv(task, tokenizer, seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)

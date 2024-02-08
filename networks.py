@@ -1,6 +1,7 @@
 import math
 import numpy as np
 import re
+from typing import Optional
 
 import torch
 from torch import nn
@@ -173,6 +174,13 @@ class RSSM(nn.Module):
         return dist
 
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
+        """
+        Predict h1, z1 (posterior) and h1, z1 (prior) from h0, z0, a0, obs1 embedding (embed).
+        (h1 posterior = h1 prior)
+        Note that when is_first is true, the previous state and action are masked out,
+        basically making this a way to create the initial state based on info from the
+        current observation (embed).
+        """
         # initialize all prev_state
         if prev_state == None or torch.sum(is_first) == len(is_first):
             prev_state = self.initial(len(is_first))
@@ -297,6 +305,7 @@ class MultiEncoder(nn.Module):
         shapes,
         mlp_keys,
         cnn_keys,
+        llm_keys,
         act,
         norm,
         cnn_depth,
@@ -305,8 +314,10 @@ class MultiEncoder(nn.Module):
         mlp_layers,
         mlp_units,
         symlog_inputs,
+        llm_kwargs,
     ):
         super(MultiEncoder, self).__init__()
+
         excluded = ("is_first", "is_last", "is_terminal", "reward")
         shapes = {
             k: v
@@ -321,8 +332,18 @@ class MultiEncoder(nn.Module):
             for k, v in shapes.items()
             if len(v) in (1, 2) and re.match(mlp_keys, k)
         }
+        self.llm_shapes = {
+            k: v
+            for k, v in shapes.items()
+            if len(v) in (1, 2) and re.match(llm_keys, k)
+        }
         print("Encoder CNN shapes:", self.cnn_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
+        print("Encoder LLM shapes:", self.llm_shapes)
+
+        if len(self.llm_shapes) > 0:
+            assert len(self.mlp_shapes) == 0 and len(self.cnn_shapes) == 0, \
+                "MLP and CNN keys should be empty if LLM keys are provided!"
 
         self.outdim = 0
         if self.cnn_shapes:
@@ -345,6 +366,9 @@ class MultiEncoder(nn.Module):
                 name="Encoder",
             )
             self.outdim += mlp_units
+        if self.llm_shapes:
+            self._llm = HFLLM(**llm_kwargs)
+            self.outdim += self._llm.outdim
 
     def forward(self, obs):
         outputs = []
@@ -354,6 +378,9 @@ class MultiEncoder(nn.Module):
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
+        if self.llm_shapes:
+            inputs = torch.cat([obs[k] for k in self.llm_shapes], -1)
+            outputs.append(self._llm(inputs))
         outputs = torch.cat(outputs, -1)
         return outputs
 
@@ -495,6 +522,87 @@ class ConvEncoder(nn.Module):
         x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
         # (batch * time, -1) -> (batch, time, -1)
         return x.reshape(list(obs.shape[:-3]) + [x.shape[-1]])
+
+
+class HFLLM(nn.Module):
+    def __init__(
+        self,
+        model_id: str,
+        frozen: bool = True,
+        pretrained: bool = True,
+        flash_attention: bool = False,
+        bf16: bool = False,
+        tokenizer_id: Optional[str] = None,
+        device: str = 'cuda',
+    ):
+        super(HFLLM, self).__init__()
+
+        dtype = torch.bfloat16 if bf16 else torch.float32
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        # Load the model
+        if pretrained:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, use_flash_attention_2=flash_attention,
+                device_map=device, torch_dtype=dtype)
+            
+            # TODO: This will only be used when there is a gated connection
+            # directly to the policy output, which is not a thing yet.
+            # Use this when that is implemented, and only store this when
+            # a flag for the skip connection is set.
+            self.lm_head = self.model.get_output_embeddings()
+            self.model = self.model.transformer
+        else:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(model_id)
+            config.use_flash_attention_2 = flash_attention
+            self.model = AutoModelForCausalLM(config=config)
+            
+            # TODO: Ditto above todo
+            self.lm_head = self.model.get_output_embeddings()
+            self.model = self.model.transformer
+
+        self.model.train()
+        self.outdim = self.lm_head.in_features
+
+        self.set_frozen(frozen)
+
+        # Load the tokenizer
+        tokenizer_name = tokenizer_id or model_id
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.pad_token_id = tokenizer.pad_token_id
+
+    def set_frozen(self, frozen: bool):
+        self.frozen = frozen
+        for param in self.model.parameters():
+            param.requires_grad = not self.frozen
+
+    def forward(self, features, dtype=None):
+        # The dimension could be (batch_size, seq_len, num_tokens) or (batch_size, num_tokens)
+        # Convert all to (batch_size * seq_len, num_tokens)
+        batch_dim = features.shape[:-1]
+        features = features.reshape(-1, features.shape[-1])
+
+        # This codebase doesn't seem to maintain the correct dtype
+        features = features.int()
+        attention_mask = (features != self.pad_token_id).int()
+
+        # Get indices of last 1s in each attention mask dim=1
+        # And then truncate all unecessary padding tokens
+        flipped_masks = torch.flip(attention_mask, dims=[1])
+        last_ones = attention_mask.shape[1] - torch.argmax(flipped_masks, dim=1)
+        max_index = last_ones.max()
+        features_truncated = features[:, :max_index]
+        attention_mask_truncated = attention_mask[:, :max_index]
+        
+        outputs = self.model(features_truncated, attention_mask=attention_mask_truncated)
+        hidden_states = outputs.last_hidden_state
+        last_hidden_states = hidden_states[range(len(hidden_states)), last_ones - 1]
+        last_hidden_states = last_hidden_states.reshape(*batch_dim, last_hidden_states.shape[-1])
+
+        return last_hidden_states
 
 
 class ConvDecoder(nn.Module):

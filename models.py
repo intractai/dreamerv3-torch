@@ -33,7 +33,7 @@ class WorldModel(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
-        self.encoder = networks.MultiEncoder(shapes, **config.encoder)
+        self.encoder = networks.MultiEncoder(shapes, llm_kwargs=config.llm, **config.encoder)
         self.embed_size = self.encoder.outdim
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
@@ -57,9 +57,15 @@ class WorldModel(nn.Module):
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
-        self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
-        )
+
+        # Temporarily disable the decoder when using LLMs to make the
+        # implementation simpler.
+        # TODO: Reimplement the decoder for LLMs.
+        if len(self.encoder.llm_shapes) == 0:
+            self.heads["decoder"] = networks.MultiDecoder(
+                feat_size, shapes, **config.decoder
+            )
+
         self.heads["reward"] = networks.MLP(
             feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
@@ -173,7 +179,8 @@ class WorldModel(nn.Module):
     # this function is called during both rollout and training
     def preprocess(self, obs):
         obs = obs.copy()
-        obs["image"] = torch.Tensor(obs["image"]) / 255.0
+        if "image" in obs:
+            obs["image"] = torch.Tensor(obs["image"]) / 255.0
         if "discount" in obs:
             obs["discount"] *= self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)

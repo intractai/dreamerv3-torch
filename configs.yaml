@@ -43,7 +43,7 @@ defaults:
   act: 'SiLU'
   norm: True
   encoder:
-    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+    {mlp_keys: '$^', cnn_keys: 'image', llm_keys: '$^', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
   actor:
@@ -60,6 +60,16 @@ defaults:
   weight_decay: 0.0
   unimix_ratio: 0.01
   initial: 'learned'
+
+  # Only used if llm_keys in encoder is not empty
+  llm:
+    model_id: 'microsoft/CodeGPT-small-py'
+    tokenizer_id: null # Defaults to model_id when null
+    frozen: True
+    pretrained: True
+    flash_attention: False
+    bf16: True # Will actually load the model weights as bf16 as opposed
+               # to just casting for training like the precision flag
 
   # Training
   batch_size: 16
@@ -92,6 +102,20 @@ defaults:
   disag_layers: 4
   disag_units: 400
   disag_action_cond: False
+
+toy_text:
+  task: 'toytext_prediction'
+  steps: 1e6
+  action_repeat: 1
+  envs: 8
+  train_ratio: 512
+  video_pred_log: false
+  encoder: {mlp_keys: '$^', cnn_keys: '$^', llm_keys: 'text'}
+  decoder: {mlp_keys: '$^', cnn_keys: '$^', llm_keys: 'text'}
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  time_limit: 100
+  grad_heads: ['reward', 'cont']
 
 dmc_proprio:
   steps: 5e5
@@ -180,5 +204,10 @@ debug:
   debug: True
   pretrain: 1
   prefill: 1
-  batch_size: 10
+  batch_size: 2
   batch_length: 20
+  dyn_hidden: 64
+  dyn_deter: 128
+  units: 128
+  train_ratio: 2
+  envs: 2
