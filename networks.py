@@ -17,6 +17,7 @@ class RSSM(nn.Module):
         stoch=30,
         deter=200,
         hidden=200,
+        stoch_residual=False,
         rec_depth=1,
         discrete=False,
         act="SiLU",
@@ -34,6 +35,7 @@ class RSSM(nn.Module):
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
+        self._stoch_residual = stoch_residual
         self._min_std = min_std
         self._rec_depth = rec_depth
         self._discrete = discrete
@@ -91,6 +93,17 @@ class RSSM(nn.Module):
             self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
             self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
 
+        if self._stoch_residual:
+            # Create 2 learnable parameters for scaling inputs to the residual connection
+            self._stoch_residual_gate = nn.Parameter(
+                torch.ones(1, device=torch.device(self._device)))
+            self._stoch_output_gate = nn.Parameter(
+                torch.zeros(1, device=torch.device(self._device)))
+            self._stats_residual_gate = nn.Parameter(
+                torch.ones(1, device=torch.device(self._device)))
+            self._stats_output_gate = nn.Parameter(
+                torch.zeros(1, device=torch.device(self._device)))
+
         if self._initial == "learned":
             self.W = torch.nn.Parameter(
                 torch.zeros((1, self._deter), device=torch.device(self._device)),
@@ -126,6 +139,14 @@ class RSSM(nn.Module):
             raise NotImplementedError(self._initial)
 
     def observe(self, embed, action, is_first, state=None):
+        """Unrolls RSSM starting from embed.
+    
+        Unrolls RSSM from a starting stochastic state (embed[:, 0]) and returns
+        sequence of posterior and prior states.
+        Prior is the series of predicted states using only the starting
+        state (embed[:, 0]).
+        Posterior is the same, but uses the observation at each timestep.
+        """
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         # (batch, time, ch) -> (time, batch, ch)
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
@@ -144,6 +165,10 @@ class RSSM(nn.Module):
         return post, prior
 
     def imagine_with_action(self, action, state):
+        """
+        Unrolls RSSM from an imagined stochastic state and
+        returns sequence of posterior and prior states.
+        """
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         assert isinstance(state, dict), state
         action = action
@@ -154,6 +179,7 @@ class RSSM(nn.Module):
         return prior
 
     def get_feat(self, state):
+        """Gets concatenated, flat h and z states."""
         stoch = state["stoch"]
         if self._discrete:
             shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
@@ -161,6 +187,7 @@ class RSSM(nn.Module):
         return torch.cat([stoch, state["deter"]], -1)
 
     def get_dist(self, state, dtype=None):
+        """Get disribution over stochastic state (z) from logits."""
         if self._discrete:
             logit = state["logit"]
             dist = torchd.independent.Independent(
@@ -205,6 +232,8 @@ class RSSM(nn.Module):
         x = torch.cat([prior["deter"], embed], -1)
         # (batch_size, prior_deter + embed) -> (batch_size, hidden)
         x = self._obs_out_layers(x)
+        if self._stoch_residual:
+            x = self._stoch_output_gate * x + self._stoch_residual_gate * embed
         # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
         stats = self._suff_stats_layer("obs", x)
         if sample:
@@ -215,6 +244,7 @@ class RSSM(nn.Module):
         return post, prior
 
     def img_step(self, prev_state, prev_action, sample=True):
+        """Predict h1 and z1 (prior) from h0, z0, a0."""
         # (batch, stoch, discrete_num)
         prev_stoch = prev_state["stoch"]
         if self._discrete:
@@ -230,6 +260,7 @@ class RSSM(nn.Module):
             # (batch, hidden), (batch, deter) -> (batch, deter), (batch, deter)
             x, deter = self._cell(x, [deter])
             deter = deter[0]  # Keras wraps the state in a list.
+        # TODO: Consider also making this residual because most transtions in text lead to a similar state
         # (batch, deter) -> (batch, hidden)
         x = self._img_out_layers(x)
         # (batch, hidden) -> (batch_size, stoch, discrete_num)
@@ -242,12 +273,14 @@ class RSSM(nn.Module):
         return prior
 
     def get_stoch(self, deter):
+        """Predict stoch (z) from deter (h)."""
         x = self._img_out_layers(deter)
         stats = self._suff_stats_layer("ims", x)
         dist = self.get_dist(stats)
         return dist.mode()
 
     def _suff_stats_layer(self, name, x):
+        """Linear projection then add noise (stochasticity) to output distribution."""
         if self._discrete:
             if name == "ims":
                 x = self._imgs_stat_layer(x)
@@ -259,12 +292,12 @@ class RSSM(nn.Module):
             return {"logit": logit}
         else:
             if name == "ims":
-                x = self._imgs_stat_layer(x)
+                new_x = self._imgs_stat_layer(x)
             elif name == "obs":
-                x = self._obs_stat_layer(x)
+                new_x = self._obs_stat_layer(x)
             else:
                 raise NotImplementedError
-            mean, std = torch.split(x, [self._stoch] * 2, -1)
+            mean, std = torch.split(new_x, [self._stoch] * 2, -1)
             mean = {
                 "none": lambda: mean,
                 "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
@@ -275,6 +308,11 @@ class RSSM(nn.Module):
                 "sigmoid": lambda: torch.sigmoid(std),
                 "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
             }[self._std_act]()
+
+            if self._stoch_residual and name == "obs":
+                mean = self._stats_output_gate * mean + self._stats_residual_gate * x
+                std = self._stats_output_gate * std
+
             std = std + self._min_std
             return {"mean": mean, "std": std}
 
@@ -369,6 +407,11 @@ class MultiEncoder(nn.Module):
         if self.llm_shapes:
             self._llm = HFLLM(**llm_kwargs)
             self.outdim += self._llm.outdim
+
+    def get_skip_connection_layer(self):
+        if self.llm_shapes:
+            return self._llm.get_lm_head()
+        return None
 
     def forward(self, obs):
         outputs = []
@@ -547,10 +590,6 @@ class HFLLM(nn.Module):
                 model_id, use_flash_attention_2=flash_attention,
                 device_map=device, torch_dtype=dtype)
             
-            # TODO: This will only be used when there is a gated connection
-            # directly to the policy output, which is not a thing yet.
-            # Use this when that is implemented, and only store this when
-            # a flag for the skip connection is set.
             self.lm_head = self.model.get_output_embeddings()
             self.model = self.model.transformer
         else:
@@ -560,7 +599,6 @@ class HFLLM(nn.Module):
             config.use_flash_attention_2 = flash_attention
             self.model = AutoModelForCausalLM(config=config)
             
-            # TODO: Ditto above todo
             self.lm_head = self.model.get_output_embeddings()
             self.model = self.model.transformer
 
@@ -573,6 +611,9 @@ class HFLLM(nn.Module):
         tokenizer_name = tokenizer_id or model_id
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.pad_token_id = tokenizer.pad_token_id
+
+    def get_lm_head(self):
+        return self.lm_head
 
     def set_frozen(self, frozen: bool):
         self.frozen = frozen
@@ -602,7 +643,7 @@ class HFLLM(nn.Module):
         last_hidden_states = hidden_states[range(len(hidden_states)), last_ones - 1]
         last_hidden_states = last_hidden_states.reshape(*batch_dim, last_hidden_states.shape[-1])
 
-        return last_hidden_states
+        return last_hidden_states.float()
 
 
 class ConvDecoder(nn.Module):
@@ -714,6 +755,9 @@ class MLP(nn.Module):
         symlog_inputs=False,
         device="cuda",
         name="NoName",
+        embed_skip_connection=False, # When True, the model accepts a second embedding input that is connected
+                                     # via a skip connection to the output of the last layer of the MLP.
+        skip_connection_layer=None, # The skip connection layer, if None uses a new linear layer
     ):
         super(MLP, self).__init__()
         self._shape = (shape,) if isinstance(shape, int) else shape
@@ -729,11 +773,13 @@ class MLP(nn.Module):
         self._unimix_ratio = unimix_ratio
         self._symlog_inputs = symlog_inputs
         self._device = device
+        self._skip_connection = embed_skip_connection
 
         self.layers = nn.Sequential()
+        layer_in_size = inp_dim
         for i in range(layers):
             self.layers.add_module(
-                f"{name}_linear{i}", nn.Linear(inp_dim, units, bias=False)
+                f"{name}_linear{i}", nn.Linear(layer_in_size, units, bias=False)
             )
             if norm:
                 self.layers.add_module(
@@ -741,29 +787,40 @@ class MLP(nn.Module):
                 )
             self.layers.add_module(f"{name}_act{i}", act())
             if i == 0:
-                inp_dim = units
+                layer_in_size = units
         self.layers.apply(tools.weight_init)
 
         if isinstance(self._shape, dict):
+            assert not self._skip_connection, \
+                f"skip_connection is only supported with single inputs, not with {self._shape}"
             self.mean_layer = nn.ModuleDict()
             for name, shape in self._shape.items():
-                self.mean_layer[name] = nn.Linear(inp_dim, np.prod(shape))
+                self.mean_layer[name] = nn.Linear(layer_in_size, np.prod(shape))
             self.mean_layer.apply(tools.uniform_weight_init(outscale))
             if self._std == "learned":
                 assert dist in ("tanh_normal", "normal", "trunc_normal", "huber"), dist
                 self.std_layer = nn.ModuleDict()
                 for name, shape in self._shape.items():
-                    self.std_layer[name] = nn.Linear(inp_dim, np.prod(shape))
+                    self.std_layer[name] = nn.Linear(layer_in_size, np.prod(shape))
                 self.std_layer.apply(tools.uniform_weight_init(outscale))
         elif self._shape is not None:
-            self.mean_layer = nn.Linear(inp_dim, np.prod(self._shape))
+            self.mean_layer = nn.Linear(layer_in_size, np.prod(self._shape))
             self.mean_layer.apply(tools.uniform_weight_init(outscale))
             if self._std == "learned":
                 assert dist in ("tanh_normal", "normal", "trunc_normal", "huber"), dist
                 self.std_layer = nn.Linear(units, np.prod(self._shape))
                 self.std_layer.apply(tools.uniform_weight_init(outscale))
 
-    def forward(self, features, dtype=None):
+        # Create a skip connection from embedding to the output of the last layer
+        if self._skip_connection:
+            assert skip_connection_layer is not None, \
+                "skip_connection_layer must be provided when embed_skip_connection is True"
+            self.skip_connection_layer = nn.Linear(inp_dim, np.prod(self._shape), bias=False)
+            given_weights = skip_connection_layer.weight.data.detach().clone().float()
+            shape = given_weights.shape
+            self.skip_connection_layer.weight.data[:shape[0], :shape[1]] = given_weights
+
+    def forward(self, features, type=None):
         x = features
         if self._symlog_inputs:
             x = tools.symlog(x)
@@ -787,6 +844,14 @@ class MLP(nn.Module):
                 std = self.std_layer(out)
             else:
                 std = self._std
+
+            if self._skip_connection:
+                # mean += self.skip_connection_layer(features)
+                # ABCD
+                mean = self.skip_connection_layer(features)
+                std = 'none' # torch.zeros_like(std) if isinstance(std, torch.Tensor) else std
+
+
             return self.dist(self._dist, mean, std, self._shape)
 
     def dist(self, dist, mean, std, shape):

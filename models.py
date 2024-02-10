@@ -39,6 +39,7 @@ class WorldModel(nn.Module):
             config.dyn_stoch,
             config.dyn_deter,
             config.dyn_hidden,
+            config.stoch_residual,
             config.dyn_rec_depth,
             config.dyn_discrete,
             config.act,
@@ -112,6 +113,7 @@ class WorldModel(nn.Module):
         )
 
     def _train(self, data):
+        """Train the model on a batch of data predicting ."""
         # action (batch_size, batch_length, act_dim)
         # image (batch_size, batch_length, h, w, ch)
         # reward (batch_size, batch_length)
@@ -121,6 +123,8 @@ class WorldModel(nn.Module):
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
                 embed = self.encoder(data)
+                # Get the posterior and prior sequences from a sequence of data
+                # The embeds and actions are of shape (batch_size, batch_length, ...)
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
                 )
@@ -218,7 +222,7 @@ class WorldModel(nn.Module):
 
 
 class ImagBehavior(nn.Module):
-    def __init__(self, config, world_model):
+    def __init__(self, config, world_model: WorldModel):
         super(ImagBehavior, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
@@ -243,6 +247,8 @@ class ImagBehavior(nn.Module):
             unimix_ratio=config.actor["unimix_ratio"],
             outscale=config.actor["outscale"],
             name="Actor",
+            embed_skip_connection=config.actor["embed_skip_connection"],
+            skip_connection_layer=world_model.encoder.get_skip_connection_layer(),
         )
         self.value = networks.MLP(
             feat_size,

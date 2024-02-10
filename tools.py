@@ -873,8 +873,8 @@ class Until:
         self._until = until
 
     def __call__(self, step):
-        if not self._until:
-            return True
+        if self._until is None:
+            return False
         return step < self._until
 
 

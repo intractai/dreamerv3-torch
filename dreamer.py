@@ -95,15 +95,15 @@ class Dreamer(nn.Module):
             latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
-            actor = self._task_behavior.actor(feat)
-            action = actor.mode()
+            act_distrib = self._task_behavior.actor(feat)
+            action = act_distrib.mode()
         elif self._should_expl(self._step):
-            actor = self._expl_behavior.actor(feat)
-            action = actor.sample()
+            act_distrib = self._expl_behavior.actor(feat)
+            action = act_distrib.sample()
         else:
-            actor = self._task_behavior.actor(feat)
-            action = actor.sample()
-        logprob = actor.log_prob(action)
+            act_distrib = self._task_behavior.actor(feat)
+            action = act_distrib.mode() # .sample() # TODO: Revert this before next commit
+        logprob = act_distrib.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
         if self._config.actor["dist"] == "onehot_gumble":
@@ -195,12 +195,15 @@ def make_env(config, mode, id):
         env = wrappers.OneHotAction(env)
     elif suite == "toytext":
         from envs.toy_text import ToyTextEnv
-        from transformers import AutoTokenizer
+        from transformers import AutoConfig, AutoTokenizer
+
+        model_config = AutoConfig.from_pretrained(config.llm['model_id'])
+        n_acts = model_config.vocab_size
 
         tokenizer_name = config.llm['tokenizer_id'] or config.llm['model_id']
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-        env = ToyTextEnv(task, tokenizer, seed=config.seed + id)
+        env = ToyTextEnv(task, tokenizer, n_acts, seed=config.seed + id)
         env = wrappers.OneHotAction(env)
     else:
         raise NotImplementedError(suite)

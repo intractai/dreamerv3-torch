@@ -17,9 +17,10 @@ def load_text(file_path):
 class ToyTextEnv:
     metadata = {}
 
-    def __init__(self, task, tokenizer, goal_words=None, seed=0):
+    def __init__(self, task, tokenizer, n_acts, goal_words=None, seed=0):
         self._task = task
         self._tokenizer = tokenizer
+        self.n_acts = n_acts
         self._env = None
         self._done = True
         self._goal_words = goal_words or load_text(
@@ -48,7 +49,7 @@ class ToyTextEnv:
     @property
     def action_space(self):
         # All actions are specified in terms of tokens, not characters
-        act_space = gym.spaces.Discrete(self._tokenizer.vocab_size)
+        act_space = gym.spaces.Discrete(self.n_acts)
         act_space.discrete = True
         return act_space
   
@@ -60,7 +61,7 @@ class ToyTextEnv:
         goal_word = np.random.choice(self._goal_words)
         tokenized_goal_word = self._tokenizer(goal_word, padding=False, add_special_tokens=False).input_ids
 
-        goal_text = self._command_token + f'write "{goal_word}"\n'
+        goal_text = self._command_token + f'write "{goal_word}"\n{self._response_token}'
         tokenized_goal_str = self._tokenizer(goal_text, padding=False, add_special_tokens=False).input_ids
         return tokenized_goal_str, tokenized_goal_word
 
@@ -103,7 +104,7 @@ class ToyTextEnv:
     def _obs(self, reward, is_first=False, is_last=False, is_terminal=False):
         # Tokenize and put together the full observation
         tokenized_text = self._tokenizer(
-            self._response_token + self._text_hist, padding=False, add_special_tokens=False).input_ids
+            self._text_hist, padding=False, add_special_tokens=False).input_ids
         obs_ids = [self._tokenizer.bos_token_id] \
             + self._tokenized_goal_str[-self._half_obs_size+1:] \
             + tokenized_text[-self._half_obs_size:]
