@@ -102,7 +102,7 @@ class Dreamer(nn.Module):
             action = act_distrib.sample()
         else:
             act_distrib = self._task_behavior.actor(feat)
-            action = act_distrib.mode() # .sample() # TODO: Revert this before next commit
+            action = act_distrib.mode() # =.sample() # TODO: Revert this before next commit
         logprob = act_distrib.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
@@ -116,16 +116,41 @@ class Dreamer(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, context, mets = self._wm._train(data)
-        metrics.update(mets)
+
+        # Train the world model if needed
+        if self._config.learn_world_model:
+            post, context, mets = self._wm._train(data)
+            metrics.update(mets)
+
+        # Otherwise we just need the posterior for training the behavior
+        else:
+            preprocessed_data = self._wm.preprocess(data)
+            with torch.cuda.amp.autocast(self._wm._use_amp):
+                embed = self._wm.encoder(preprocessed_data)
+                # Get the posterior and prior sequences from a sequence of data
+                # The embeds and actions are of shape (batch_size, batch_length, ...)
+                post, prior = self._wm.dynamics.observe(
+                    embed, preprocessed_data["action"], preprocessed_data["is_first"]
+                )
         start = post
-        reward = lambda f, s, a: self._wm.heads["reward"](
-            self._wm.dynamics.get_feat(s)
-        ).mode()
-        metrics.update(self._task_behavior._train(start, reward)[-1])
+
+        self._task_behavior._update_slow_target() # Update target value function
+
+        # Learn from the world model
+        if self._config.learn_from_model:
+            reward_func = lambda f, s, a: self._wm.heads["reward"](
+                self._wm.dynamics.get_feat(s)
+            ).mode()
+            metrics.update(self._task_behavior._train_from_model(start, reward_func)[-1])
+
+        # Learn online from real data
+        if self._config.learn_online:
+            metrics.update(self._task_behavior._train_online(start, data)[-1])
+
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(start, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
+
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]

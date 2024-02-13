@@ -73,6 +73,7 @@ defaults:
 
   learn_online: True
   learn_from_model: True
+  learn_world_model: True
   stoch_residual: False # If true, stoch encoder layer will be residual
                         # i.e. z = emebd + f(embed, h) instead of z = f(embed, h)
                         # This also means that the dim of z will need to be the same as embed
@@ -122,6 +123,7 @@ toy_text:
   imag_gradient: 'reinforce'
   time_limit: 100
   grad_heads: ['reward', 'cont']
+  learn_world_model: False
   learn_from_model: False
   dyn_stoch: 768 # Required to be same as embedding for stoch_residual
   dyn_hidden: 768

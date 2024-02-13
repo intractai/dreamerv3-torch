@@ -293,29 +293,86 @@ class ImagBehavior(nn.Module):
             self.register_buffer("ema_vals", torch.zeros((2,)).to(self._config.device))
             self.reward_ema = RewardEMA(device=self._config.device)
 
-    def _train(
+    def _train_online(
+            self, 
+            start,
+            data,
+        ):
+        rewards = data["reward"]
+        actions = data["action"]
+
+        feats = self._world_model.dynamics.get_feat(start)
+
+        # Swap the batch and sequence dimensions (sequence dim should be first)
+        rewards = torch.from_numpy(rewards).swapaxes(0, 1).to(self._config.device)
+        actions = torch.from_numpy(actions).swapaxes(0, 1).to(self._config.device)
+        feats = feats.swapaxes(0, 1)
+        
+        feats, actions, weights, metrics = self._train(feats, actions, rewards.unsqueeze(-1))
+
+        # Update metrics with "_offline" suffix
+        metrics = {f"{key}_online": value for key, value in metrics.items()}
+        
+        return feats, actions, weights, metrics
+
+    def _train_from_model(
         self,
         start,
         objective,
     ):
-        self._update_slow_target()
-        metrics = {}
+        """Train the model on a batch of data imagined by the world model.
+        
+        Args:
+            start (dict): The posterior states from one or more rollouts.
+                Shape: (seq_len, batch_size, ...)
+            objective (callable): The objective function to be maximized.
+                It should take the imagined states and actions as input and
+                return a scalar reward.
+        """
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
+                # Each is of shape (seq_len, batch_size, ...)
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
                 reward = objective(imag_feat, imag_state, imag_action)
-                actor_ent = self.actor(imag_feat).entropy()
-                state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
+
+        feats, actions, weights, metrics = self._train(imag_feat, imag_action, reward)
+
+        # Update metrics with "_offline" suffix
+        metrics = {f"{key}_imagined": value for key, value in metrics.items()}
+
+        return feats, actions, weights, metrics
+
+    def _train(
+        self,
+        feats,
+        actions,
+        rewards
+    ):
+        """Train the model on a batch of data imagined by the world model.
+        
+        Trains both the policy and value function.
+        
+        Args:
+            feats (torch.Tensor): State feature rollouts of the shape
+                (seq_len, batch_size, feature_dim).
+            actions (torch.Tensor): Actions rollouts of the shape
+                (seq_len, batch_size, act_dim).
+            rewards (torch.Tensor): Rewards rollouts of the shape
+                (seq_len, batch_size, 1).
+            """
+        metrics = {}
+
+        with tools.RequiresGrad(self.actor):
+            with torch.cuda.amp.autocast(self._use_amp):
+                actor_ent = self.actor(feats).entropy()
                 # this target is not scaled by ema or sym_log.
-                target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward
-                )
+                target, weights, base = self._compute_target(feats, rewards)
                 actor_loss, mets = self._compute_actor_loss(
-                    imag_feat,
-                    imag_action,
+                    feats,
+                    actions,
                     target,
                     weights,
                     base,
@@ -323,7 +380,7 @@ class ImagBehavior(nn.Module):
                 actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
                 actor_loss = torch.mean(actor_loss)
                 metrics.update(mets)
-                value_input = imag_feat
+                value_input = feats
 
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
@@ -339,20 +396,20 @@ class ImagBehavior(nn.Module):
 
         metrics.update(tools.tensorstats(value.mode(), "value"))
         metrics.update(tools.tensorstats(target, "target"))
-        metrics.update(tools.tensorstats(reward, "imag_reward"))
+        metrics.update(tools.tensorstats(rewards, "imag_reward"))
         if self._config.actor["dist"] in ["onehot"]:
             metrics.update(
                 tools.tensorstats(
-                    torch.argmax(imag_action, dim=-1).float(), "imag_action"
+                    torch.argmax(actions, dim=-1).float(), "imag_action"
                 )
             )
         else:
-            metrics.update(tools.tensorstats(imag_action, "imag_action"))
+            metrics.update(tools.tensorstats(actions, "imag_action"))
         metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
         with tools.RequiresGrad(self):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
-        return imag_feat, imag_state, imag_action, weights, metrics
+        return feats, actions, weights, metrics
 
     def _imagine(self, start, policy, horizon):
         dynamics = self._world_model.dynamics
@@ -374,10 +431,9 @@ class ImagBehavior(nn.Module):
 
         return feats, states, actions
 
-    def _compute_target(self, imag_feat, imag_state, reward):
+    def _compute_target(self, imag_feat, reward):
         if "cont" in self._world_model.heads:
-            inp = self._world_model.dynamics.get_feat(imag_state)
-            discount = self._config.discount * self._world_model.heads["cont"](inp).mean
+            discount = self._config.discount * self._world_model.heads["cont"](imag_feat).mean
         else:
             discount = self._config.discount * torch.ones_like(reward)
         value = self.value(imag_feat).mode()
